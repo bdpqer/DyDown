@@ -22,6 +22,7 @@ keystore.properties
 # 真机抓包 / 调试数据
 tmp_*.json
 tmp_*.txt
+tmp_*/
 last_scrape.json
 last_live.txt
 dydown_debug/

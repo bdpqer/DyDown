@@ -69,8 +69,9 @@ app/src/main/java/com/dydown/app/
 │   ├── LiveRecorder      直播流按字节落盘
 │   └── Ffmpeg            FLV→MP4 无损转封装（尽力而为）
 ├── service/         DownloadService（前台服务队列）、LiveRecordService
-├── data/            Prefs（保存目录等）、Room 任务表
+├── data/            Prefs（保存目录等）、Room 任务表 + 独立 history 表、封面缓存
 └── ui/              Compose：设置 / 解析 / 批量 / 录播 / 任务 五个标签页
+                     （任务页内再分「队列 / 历史」）
 ```
 
 **为什么用前台服务而不是 WorkManager**：批量下大文件会撞 10 分钟后台任务上限，
@@ -108,6 +109,23 @@ arm64 单架构 debug APK 约 **42MB**（python 11MB + ffmpeg 14MB + Compose）�
 
 - 视频 / 直播：`Movies/DyDown`（可改，直播落其 `live` 子目录）
 - 图集：`Pictures/DyDown`（可改，每个作品一个 `gallery_<id>` 子目录）
+
+### 历史记录
+
+「任务」页顶部可切到「历史」，记录四类事件：`PARSE`（解析成功/失败）、
+`DOWNLOAD`（含成品 Uri、大小、结束时间）、`BATCH`（主页与条数）、`LIVE`（时长与大小）。
+支持按类型筛选、按标题/作者搜索、打开成品、用**原始分享链接重新解析**、清空记录。
+历史存本地 Room 的独立 `history` 表，**不上传**；清空历史只删数据库记录，不删相册文件。
+批量下载默认静默跳过已成功的作品，可在「设置」关掉该开关。
+
+设计上有两点值得注意：
+
+- 数据库从 v1 升到 v2 时用显式 `Migration(1,2)`（只建新表 + 回填旧任务），
+  不用 `fallbackToDestructiveMigration`，否则覆盖安装会清空原有任务；
+- 列表查询用**列投影 + 行数上限**（tasks 800 / history 2000），不 `SELECT *` 全表。
+  Android 的 `CursorWindow` 只有 2MB，累计上千行且每行带图集 URL JSON 时，
+  Room 遍历到窗口外会抛 `IllegalStateException` 并被 WebView 的异常处理器杀进程。
+  下载执行读的是单独的单行查询，不受投影影响。
 
 ---
 

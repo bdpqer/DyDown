@@ -1,5 +1,7 @@
 package com.dydown.app.ui
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -51,6 +53,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -60,12 +63,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -75,8 +80,14 @@ import coil.compose.AsyncImage
 import com.dydown.app.core.Kind
 import com.dydown.app.core.LiveInfo
 import com.dydown.app.core.MediaMeta
+import com.dydown.app.data.HStatus
+import com.dydown.app.data.HType
+import com.dydown.app.data.HistoryEntity
 import com.dydown.app.data.TStatus
 import com.dydown.app.data.TaskEntity
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -84,6 +95,9 @@ import java.util.Locale
 fun AppRoot(vm: MainViewModel, initialLink: String? = null) {
     // 0=设置 1=解析 2=批量 3=录播 4=任务；设置按需求并入底栏并排在最左
     var tab by remember { mutableIntStateOf(1) }
+    // 历史页点「重新解析」时把原文带到解析页，nonce 保证同一链接也能重复触发
+    var reparseLink by remember { mutableStateOf<String?>(null) }
+    var reparseNonce by remember { mutableIntStateOf(0) }
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(vm.toast) {
@@ -129,10 +143,14 @@ fun AppRoot(vm: MainViewModel, initialLink: String? = null) {
         Box(Modifier.padding(padding)) {
             when (tab) {
                 0 -> SettingsScreen(vm)
-                1 -> HomeScreen(vm, initialLink)
+                1 -> HomeScreen(vm, initialLink, reparseLink, reparseNonce)
                 2 -> BatchScreen(vm)
                 3 -> LiveScreen(vm)
-                else -> TasksScreen(vm)
+                else -> TasksScreen(vm) { link ->
+                    reparseLink = link
+                    reparseNonce++
+                    tab = 1
+                }
             }
         }
     }
@@ -151,14 +169,29 @@ private fun RowScope.NavItem(current: Int, index: Int, label: String, icon: Imag
 /* ----------------------------- 解析页 ----------------------------- */
 
 @Composable
-private fun HomeScreen(vm: MainViewModel, initialLink: String?) {
+private fun HomeScreen(
+    vm: MainViewModel,
+    initialLink: String?,
+    reparseLink: String? = null,
+    reparseNonce: Int = 0
+) {
     val clipboard = LocalClipboardManager.current
-    var text by remember { mutableStateOf(initialLink.orEmpty()) }
+    var text by rememberSaveable { mutableStateOf(initialLink.orEmpty()) }
+    var consumedNonce by rememberSaveable { mutableStateOf(-1) }
 
     LaunchedEffect(initialLink) {
         if (!initialLink.isNullOrBlank()) {
             text = initialLink
             vm.parse(initialLink)
+        }
+    }
+
+    LaunchedEffect(reparseNonce) {
+        val link = reparseLink
+        if (reparseNonce > 0 && reparseNonce != consumedNonce && !link.isNullOrBlank()) {
+            consumedNonce = reparseNonce
+            text = link
+            vm.parse(link)
         }
     }
 
@@ -547,8 +580,8 @@ private fun LiveCard(vm: MainViewModel, info: LiveInfo) {
 /* ----------------------------- 任务页 ----------------------------- */
 
 @Composable
-private fun TasksScreen(vm: MainViewModel) {
-    val tasks by vm.tasks.collectAsStateWithLifecycle()
+private fun TasksScreen(vm: MainViewModel, onReparse: (String) -> Unit) {
+    var section by rememberSaveable { mutableStateOf(0) }  // 0=队列 1=历史
 
     Column(
         Modifier
@@ -556,12 +589,26 @@ private fun TasksScreen(vm: MainViewModel) {
             .padding(horizontal = 16.dp)
     ) {
         Row(Modifier.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            FilterChip(selected = section == 0, onClick = { section = 0 }, label = { Text("队列") })
+            Spacer(Modifier.width(8.dp))
+            FilterChip(selected = section == 1, onClick = { section = 1 }, label = { Text("历史") })
+        }
+        HorizontalDivider()
+        if (section == 0) QueueSection(vm, Modifier.weight(1f))
+        else HistorySection(vm, onReparse, Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun QueueSection(vm: MainViewModel, modifier: Modifier = Modifier) {
+    val tasks by vm.tasks.collectAsStateWithLifecycle()
+    Column(modifier.fillMaxSize()) {
+        Row(Modifier.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("${tasks.size} 个任务", style = MaterialTheme.typography.labelLarge)
             Spacer(Modifier.weight(1f))
             TextButton(onClick = { vm.clearFinished() }) { Text("清理已完成") }
         }
         HorizontalDivider()
-
         if (tasks.isEmpty()) {
             CenterHint("还没有任务，去「解析」页粘一条链接")
         } else {
@@ -570,6 +617,184 @@ private fun TasksScreen(vm: MainViewModel) {
             }
         }
     }
+}
+
+@Composable
+private fun HistorySection(
+    vm: MainViewModel,
+    onReparse: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val all by vm.history.collectAsStateWithLifecycle()
+    var query by rememberSaveable { mutableStateOf("") }
+    var type by rememberSaveable { mutableStateOf("") }
+    val filters = listOf(
+        "" to "全部",
+        HType.PARSE to "解析",
+        HType.DOWNLOAD to "下载",
+        HType.BATCH to "批量",
+        HType.LIVE to "录播"
+    )
+    val list = all.filter { h ->
+        (type.isEmpty() || h.type == type) &&
+            (query.isBlank() || h.title.contains(query, true) || h.author.contains(query, true))
+    }
+
+    Column(modifier.fillMaxSize()) {
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("搜索标题或作者") },
+            trailingIcon = {
+                if (query.isNotEmpty()) {
+                    IconButton(onClick = { query = "" }) {
+                        Icon(Icons.Default.Clear, contentDescription = "清空搜索")
+                    }
+                }
+            }
+        )
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(filters) { (key, label) ->
+                FilterChip(selected = type == key, onClick = { type = key }, label = { Text(label) })
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("${list.size} 条记录", style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = { vm.clearHistory() }) { Text("清空历史") }
+        }
+        HorizontalDivider()
+        if (list.isEmpty()) {
+            CenterHint("还没有历史记录，去解析或下载一条")
+        } else {
+            LazyColumn(Modifier.weight(1f)) {
+                items(list, key = { it.id }) { h -> HistoryRow(vm, h, onReparse) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryRow(vm: MainViewModel, h: HistoryEntity, onReparse: (String) -> Unit) {
+    val context = LocalContext.current
+    Column(Modifier.padding(vertical = 10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (h.coverPath != null) {
+                AsyncImage(
+                    model = File(h.coverPath),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(44.dp, 58.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                )
+            } else {
+                Box(
+                    Modifier
+                        .size(44.dp, 58.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        when (h.type) {
+                            HType.PARSE -> Icons.Default.Search
+                            HType.BATCH -> Icons.Default.List
+                            HType.LIVE -> Icons.Default.PlayArrow
+                            else -> Icons.Default.Done
+                        },
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    h.title.ifBlank { historyTypeLabel(h.type) },
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    historyTypeLabel(h.type) + " · " + historyStatus(h) +
+                        (if (h.author.isNotBlank()) " · @${h.author}" else ""),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = when (h.status) {
+                        HStatus.OK -> MaterialTheme.colorScheme.primary
+                        HStatus.FAILED -> MaterialTheme.colorScheme.error
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    formatTime(h.createdAt) + historyExtra(h),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (h.fileUri != null) {
+                IconButton(onClick = {
+                    runCatching {
+                        val i = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(
+                                Uri.parse(h.fileUri),
+                                if (h.kind == "GALLERY") "image/*" else "video/*"
+                            )
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        context.startActivity(i)
+                    }.onFailure { vm.toast = "打不开：文件可能已被删除" }
+                }) { Icon(Icons.Default.PlayArrow, contentDescription = "打开成品") }
+            }
+            if (h.sourceLink.isNotBlank()) {
+                IconButton(onClick = { onReparse(h.sourceLink) }) {
+                    Icon(Icons.Default.Refresh, contentDescription = "重新解析")
+                }
+            }
+            IconButton(onClick = { vm.deleteHistory(h) }) {
+                Icon(Icons.Default.Clear, contentDescription = "删除记录")
+            }
+        }
+    }
+    HorizontalDivider()
+}
+
+private fun historyTypeLabel(type: String): String = when (type) {
+    HType.PARSE -> "解析"
+    HType.DOWNLOAD -> "下载"
+    HType.BATCH -> "批量"
+    HType.LIVE -> "录播"
+    else -> type
+}
+
+private fun historyStatus(h: HistoryEntity): String = when (h.status) {
+    HStatus.OK -> "成功"
+    HStatus.FAILED -> h.error?.take(40) ?: "失败"
+    HStatus.PENDING -> "进行中"
+    HStatus.CANCELED -> "已取消"
+    else -> h.status
+}
+
+private fun historyExtra(h: HistoryEntity): String {
+    val parts = mutableListOf<String>()
+    if (h.bytes > 0) parts.add(formatSize(h.bytes))
+    if (h.type == HType.BATCH && h.count > 0) parts.add("${h.count} 条")
+    if (h.type == HType.LIVE) {
+        h.finishedAt?.let { parts.add("录制 " + formatDuration(it - h.createdAt)) }
+    }
+    return if (parts.isEmpty()) "" else " · " + parts.joinToString(" · ")
+}
+
+private fun formatTime(ms: Long): String =
+    SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(ms))
+
+private fun formatDuration(ms: Long): String {
+    val s = (ms / 1000).coerceAtLeast(0)
+    return if (s >= 60) "${s / 60} 分 ${s % 60} 秒" else "$s 秒"
 }
 
 @Composable
@@ -717,11 +942,32 @@ private fun SettingsScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
         Spacer(Modifier.height(20.dp))
         HorizontalDivider()
         Spacer(Modifier.height(12.dp))
+
+        Text("历史与去重", style = MaterialTheme.typography.labelLarge)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("批量跳过已下载", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "按作品 ID 去重，只作用于批量下载；单条下载不拦截",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(
+                checked = vm.batchSkipDownloaded,
+                onCheckedChange = { vm.updateBatchSkipDownloaded(it) }
+            )
+        }
+
+        Spacer(Modifier.height(20.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(12.dp))
         Text("说明", style = MaterialTheme.typography.labelLarge)
         Text(
             "· 默认：视频 Movies/DyDown，图集 Pictures/DyDown\n" +
                 "· 图集会在所填目录下再建 gallery_作品ID 子目录\n" +
                 "· 直播录制约 1 小时 500MB-1GB，注意存储\n" +
+                "· 「任务 → 历史」记录解析/下载/批量/录播，清空记录不会删除文件\n" +
                 "· 仅供个人离线保存，不要二次发布或商用",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant

@@ -1,14 +1,21 @@
 package com.dydown.app.ui
 
 import android.app.Application
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.dydown.app.DyDownApp
+import com.dydown.app.core.Kind
 import com.dydown.app.core.LiveInfo
 import com.dydown.app.core.MediaMeta
+import com.dydown.app.data.CoverCache
+import com.dydown.app.data.HStatus
+import com.dydown.app.data.HType
+import com.dydown.app.data.HistoryEntity
+import com.dydown.app.data.HistoryRepo
 import com.dydown.app.data.TStatus
 import com.dydown.app.data.TaskEntity
 import com.dydown.app.data.TaskRepo
@@ -19,6 +26,7 @@ import com.dydown.app.ytdlp.YtDlp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -48,6 +56,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val prefs = (app as DyDownApp).prefs
     private val repo = ParseRepository(ctx, prefs)
 
+    /** 最近一次解析/直播的输入原文，历史记录重新解析全靠它 */
+    private var lastParseLink: String = ""
+    private var lastLiveLink: String = ""
+
     var parseState by mutableStateOf<UiState<MediaMeta>>(UiState.Idle)
         private set
     var qualityIndex by mutableStateOf(prefs.qualityIndex)
@@ -62,9 +74,26 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var updatingYtDlp by mutableStateOf(false)
         private set
+    var batchSkipDownloaded by mutableStateOf(prefs.batchSkipDownloaded)
+        private set
     var toast by mutableStateOf<String?>(null)
 
+    // Room Flow 的异常如果没人捕获，会被 WebView 注册的 JavaExceptionReporter 当成
+    // 未捕获异常直接杀进程。这里兜底成空列表 + 提示，保证数据库再出问题也只是列表不显示。
     val tasks: StateFlow<List<TaskEntity>> = TaskRepo.observe(ctx)
+        .catch { e ->
+            Log.e("DyDown", "tasks flow failed", e)
+            toast = "任务列表读取失败：${e.message ?: "数据库异常"}"
+            emit(emptyList())
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(3000), emptyList())
+
+    val history: StateFlow<List<HistoryEntity>> = HistoryRepo.observe(ctx)
+        .catch { e ->
+            Log.e("DyDown", "history flow failed", e)
+            toast = "历史记录读取失败：${e.message ?: "数据库异常"}"
+            emit(emptyList())
+        }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(3000), emptyList())
 
     fun clearToast() { toast = null }
@@ -74,16 +103,43 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             parseState = UiState.Err("先粘贴一条抖音链接")
             return
         }
+        lastParseLink = text.trim()
         parseState = UiState.Loading
         viewModelScope.launch {
             try {
                 val meta = repo.parse(text)
                 qualityIndex = 0
                 parseState = UiState.Ok(meta)
+                val id = HistoryRepo.insert(
+                    ctx,
+                    HistoryEntity(
+                        type = HType.PARSE,
+                        awemeId = meta.awemeId,
+                        title = meta.title.ifBlank { "抖音作品" },
+                        author = meta.author,
+                        sourceLink = lastParseLink,
+                        kind = meta.kind.name,
+                        status = HStatus.OK,
+                        count = mediaCount(meta),
+                        finishedAt = System.currentTimeMillis()
+                    )
+                )
+                cacheCover(id, meta.awemeId, meta.cover)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                parseState = UiState.Err(e.message ?: "解析失败")
+                val msg = e.message ?: "解析失败"
+                parseState = UiState.Err(msg)
+                HistoryRepo.insert(
+                    ctx,
+                    HistoryEntity(
+                        type = HType.PARSE,
+                        sourceLink = lastParseLink,
+                        status = HStatus.FAILED,
+                        error = msg,
+                        finishedAt = System.currentTimeMillis()
+                    )
+                )
             }
         }
     }
@@ -93,21 +149,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         prefs.qualityIndex = index
     }
 
+    /** 单条下载：不拦截重复，想重下随时可以 */
     fun enqueue(meta: MediaMeta, index: Int = 0, silent: Boolean = false) {
         if (meta.videos.isEmpty() && meta.images.isEmpty()) return
-        val task = TaskEntity(
-            awemeId = meta.awemeId,
-            kind = meta.kind.name,
-            title = meta.title.ifBlank { "抖音作品" },
-            author = meta.author,
-            cover = meta.cover,
-            videoUrl = meta.videos.getOrNull(index)?.url,
-            images = meta.images.joinToString("\n"),
-            musicUrl = meta.music?.url,
-            quality = meta.videos.getOrNull(index)?.label ?: if (meta.images.isNotEmpty()) "${meta.images.size} 张图" else ""
-        )
+        val task = taskFrom(meta, index)
+        val link = linkFor(meta.awemeId)
         viewModelScope.launch {
-            TaskRepo.insert(ctx, task)
+            val taskId = TaskRepo.insert(ctx, task)
+            val cover = CoverCache.save(ctx, meta.awemeId, meta.cover)
+            HistoryRepo.insert(
+                ctx,
+                HistoryEntity(
+                    type = HType.DOWNLOAD,
+                    awemeId = meta.awemeId,
+                    title = task.title,
+                    author = task.author,
+                    sourceLink = link,
+                    kind = meta.kind.name,
+                    status = HStatus.PENDING,
+                    count = mediaCount(meta),
+                    coverPath = cover,
+                    taskId = taskId
+                )
+            )
             DownloadService.start(ctx)
             if (!silent) toast = "已加入下载队列"
         }
@@ -118,10 +182,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             batch = batch.copy(error = "先粘贴主页链接")
             return
         }
+        val link = text.trim()
         batch = BatchUi(loading = true)
         viewModelScope.launch {
             try {
-                val secUid = repo.resolveUser(text)
+                val secUid = repo.resolveUser(link)
                 var cursor = 0L
                 var page = repo.userPosts(secUid, cursor)
                 val all = ArrayList<MediaMeta>(page.items)
@@ -139,21 +204,48 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     cursor = page.cursor
                     pagesDone++
                 }
+                val items = all.distinctBy { it.awemeId }
                 batch = BatchUi(
                     loading = false,
                     secUid = secUid,
-                    items = all.distinctBy { it.awemeId },
-                    selected = all.map { it.awemeId }.toSet(),
+                    items = items,
+                    selected = items.map { it.awemeId }.toSet(),
                     error = null,
                     pages = pagesDone,
                     hasMore = page.hasMore,
                     cursor = cursor,
-                    total = all.size
+                    total = items.size
                 )
+                val id = HistoryRepo.insert(
+                    ctx,
+                    HistoryEntity(
+                        type = HType.BATCH,
+                        awemeId = secUid,
+                        secUid = secUid,
+                        title = "主页作品 ${items.size} 条",
+                        author = items.firstOrNull()?.author.orEmpty(),
+                        sourceLink = link,
+                        status = HStatus.OK,
+                        count = items.size,
+                        finishedAt = System.currentTimeMillis()
+                    )
+                )
+                cacheCover(id, secUid, items.firstOrNull()?.cover)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                batch = BatchUi(loading = false, error = e.message ?: "拉取失败")
+                val msg = e.message ?: "拉取失败"
+                batch = BatchUi(loading = false, error = msg)
+                HistoryRepo.insert(
+                    ctx,
+                    HistoryEntity(
+                        type = HType.BATCH,
+                        sourceLink = link,
+                        status = HStatus.FAILED,
+                        error = msg,
+                        finishedAt = System.currentTimeMillis()
+                    )
+                )
             }
         }
     }
@@ -190,6 +282,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         batch = batch.copy(selected = if (all) batch.items.map { it.awemeId }.toSet() else emptySet())
     }
 
+    /** 批量下载：按已成功下载的 awemeId 静默跳过，失败/取消的不算 */
     fun downloadSelected() {
         val chosen = batch.items.filter { batch.selected.contains(it.awemeId) }
         if (chosen.isEmpty()) {
@@ -197,25 +290,39 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         viewModelScope.launch {
-            chosen.forEach { meta ->
+            val skip: Set<String> = if (prefs.batchSkipDownloaded) {
+                HistoryRepo.downloadedIds(ctx).toHashSet()
+            } else emptySet()
+            val targets = chosen.filterNot { skip.contains(it.awemeId) }
+            val skipped = chosen.size - targets.size
+            if (targets.isEmpty()) {
+                toast = "全部 ${chosen.size} 条已下载过，已跳过"
+                return@launch
+            }
+            var added = 0
+            targets.forEach { meta ->
                 if (meta.videos.isEmpty() && meta.images.isEmpty()) return@forEach
-                TaskRepo.insert(
+                val taskId = TaskRepo.insert(ctx, taskFrom(meta, 0))
+                HistoryRepo.insert(
                     ctx,
-                    TaskEntity(
+                    HistoryEntity(
+                        type = HType.DOWNLOAD,
                         awemeId = meta.awemeId,
-                        kind = meta.kind.name,
                         title = meta.title.ifBlank { "抖音作品" },
                         author = meta.author,
-                        cover = meta.cover,
-                        videoUrl = meta.videos.firstOrNull()?.url,
-                        images = meta.images.joinToString("\n"),
-                        musicUrl = meta.music?.url,
-                        quality = meta.videos.firstOrNull()?.label ?: ""
+                        // 批量没有单条分享文案，用可解析的作品长链兜底
+                        sourceLink = "https://www.douyin.com/video/${meta.awemeId}",
+                        kind = meta.kind.name,
+                        status = HStatus.PENDING,
+                        count = mediaCount(meta),
+                        taskId = taskId
                     )
                 )
+                added++
             }
             DownloadService.start(ctx)
-            toast = "已加入 ${chosen.size} 个任务"
+            toast = "已加入 $added 个任务" +
+                if (skipped > 0) "，跳过 $skipped 条已下载" else ""
         }
     }
 
@@ -224,6 +331,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             liveState = UiState.Err("先粘贴直播间链接")
             return
         }
+        lastLiveLink = text.trim()
         liveState = UiState.Loading
         viewModelScope.launch {
             try {
@@ -243,6 +351,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         viewModelScope.launch {
+            // 直播任务直接置 RUNNING：否则会被下载队列当 QUEUED 任务捞走并失败
             val taskId = TaskRepo.insert(
                 ctx,
                 TaskEntity(
@@ -252,7 +361,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     author = info.author,
                     cover = info.cover,
                     liveUrl = url,
-                    quality = "直播"
+                    quality = "直播",
+                    status = TStatus.RUNNING
+                )
+            )
+            val cover = CoverCache.save(ctx, info.roomId, info.cover)
+            HistoryRepo.insert(
+                ctx,
+                HistoryEntity(
+                    type = HType.LIVE,
+                    awemeId = info.roomId,
+                    title = info.title,
+                    author = info.author,
+                    sourceLink = lastLiveLink,
+                    kind = "LIVE",
+                    status = HStatus.PENDING,
+                    coverPath = cover,
+                    taskId = taskId
                 )
             )
             LiveRecordService.start(ctx, taskId, url, info.title)
@@ -266,10 +391,61 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         recording = false
     }
 
+    /** 失败重试：CDN 地址会过期，优先用历史里的原始链接重新解析 */
     fun retry(task: TaskEntity) {
         viewModelScope.launch {
-            TaskRepo.requeue(ctx, task.id)
-            DownloadService.start(ctx)
+            val link = HistoryRepo.sourceLinkByTask(ctx, task.id)
+            if (link.isNullOrBlank()) {
+                TaskRepo.requeue(ctx, task.id)
+                DownloadService.start(ctx)
+                toast = "已用原地址重试（可能已过期）"
+                return@launch
+            }
+            try {
+                val meta = repo.parse(link)
+                lastParseLink = link
+                parseState = UiState.Ok(meta)
+                val newTask = task.copy(
+                    id = 0,
+                    awemeId = meta.awemeId.ifBlank { task.awemeId },
+                    kind = meta.kind.name,
+                    title = meta.title.ifBlank { task.title },
+                    author = meta.author.ifBlank { task.author },
+                    cover = meta.cover ?: task.cover,
+                    videoUrl = meta.videos.firstOrNull()?.url,
+                    images = meta.images.joinToString("\n"),
+                    musicUrl = meta.music?.url,
+                    status = TStatus.QUEUED,
+                    progress = 0,
+                    bytes = 0,
+                    total = 0,
+                    error = null,
+                    createdAt = System.currentTimeMillis()
+                )
+                val newId = TaskRepo.insert(ctx, newTask)
+                HistoryRepo.insert(
+                    ctx,
+                    HistoryEntity(
+                        type = HType.DOWNLOAD,
+                        awemeId = newTask.awemeId,
+                        title = newTask.title,
+                        author = newTask.author,
+                        sourceLink = link,
+                        kind = newTask.kind,
+                        status = HStatus.PENDING,
+                        taskId = newId
+                    )
+                )
+                TaskRepo.delete(ctx, task.id)
+                DownloadService.start(ctx)
+                toast = "已重新解析并入队"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                TaskRepo.requeue(ctx, task.id)
+                DownloadService.start(ctx)
+                toast = "重新解析失败，已用原地址重试：${e.message}"
+            }
         }
     }
 
@@ -279,6 +455,65 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearFinished() {
         viewModelScope.launch { TaskRepo.clearFinished(ctx) }
+    }
+
+    /* ----------------------------- 历史记录 ----------------------------- */
+
+    fun deleteHistory(h: HistoryEntity) {
+        viewModelScope.launch { HistoryRepo.delete(ctx, h.id) }
+    }
+
+    /** 只删记录，不动相册里的成品文件 */
+    fun clearHistory() {
+        viewModelScope.launch {
+            HistoryRepo.clear(ctx)
+            toast = "历史已清空，已保存的文件保留"
+        }
+    }
+
+    fun updateBatchSkipDownloaded(v: Boolean) {
+        prefs.batchSkipDownloaded = v
+        batchSkipDownloaded = v
+    }
+
+    /** UI 从历史页点「重新解析」时用原文再解析一次 */
+    fun reparse(link: String) {
+        lastParseLink = link
+        parse(link)
+    }
+
+    private fun taskFrom(meta: MediaMeta, index: Int) = TaskEntity(
+        awemeId = meta.awemeId,
+        kind = meta.kind.name,
+        title = meta.title.ifBlank { "抖音作品" },
+        author = meta.author,
+        cover = meta.cover,
+        videoUrl = meta.videos.getOrNull(index)?.url,
+        images = meta.images.joinToString("\n"),
+        musicUrl = meta.music?.url,
+        quality = meta.videos.getOrNull(index)?.label
+            ?: if (meta.images.isNotEmpty()) "${meta.images.size} 张图" else ""
+    )
+
+    private fun mediaCount(meta: MediaMeta): Int =
+        if (meta.kind == Kind.GALLERY) meta.images.size else meta.videos.size
+
+    /** 单条解析下载用原始分享文案；批量作品用可解析的长链兜底 */
+    private fun linkFor(awemeId: String): String {
+        val current = (parseState as? UiState.Ok)?.data
+        return when {
+            current != null && current.awemeId == awemeId && lastParseLink.isNotBlank() -> lastParseLink
+            awemeId.isNotBlank() -> "https://www.douyin.com/video/$awemeId"
+            else -> ""
+        }
+    }
+
+    /** 封面异步缓存，不阻塞历史记录写入 */
+    private fun cacheCover(id: Long, key: String, url: String?) {
+        viewModelScope.launch {
+            val path = CoverCache.save(ctx, key, url)
+            if (path != null) HistoryRepo.updateCover(ctx, id, path)
+        }
     }
 
     fun updateYtDlp() {

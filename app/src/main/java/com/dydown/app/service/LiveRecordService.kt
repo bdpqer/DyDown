@@ -6,6 +6,9 @@ import android.content.Intent
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.dydown.app.DyDownApp
+import com.dydown.app.data.HStatus
+import com.dydown.app.data.HistoryRepo
 import com.dydown.app.data.TStatus
 import com.dydown.app.data.TaskRepo
 import com.dydown.app.download.Ffmpeg
@@ -84,7 +87,9 @@ class LiveRecordService : Service() {
                 throw e
             } catch (e: Exception) {
                 withContext(NonCancellable) {
-                    TaskRepo.setStatus(this@LiveRecordService, taskId, TStatus.FAILED, e.message ?: "录制失败")
+                    val msg = e.message ?: "录制失败"
+                    TaskRepo.setStatus(this@LiveRecordService, taskId, TStatus.FAILED, msg)
+                    HistoryRepo.finishByTask(this@LiveRecordService, taskId, HStatus.FAILED, error = msg)
                     runCatching { tmp.delete() }
                 }
             } finally {
@@ -97,6 +102,7 @@ class LiveRecordService : Service() {
     private suspend fun finalize(taskId: Long, flv: File) {
         if (!flv.exists() || flv.length() < 1024) {
             TaskRepo.setStatus(this, taskId, TStatus.FAILED, "没有录到数据")
+            HistoryRepo.finishByTask(this, taskId, HStatus.FAILED, error = "没有录到数据")
             return
         }
         val mp4 = File(cacheDir, "live_$taskId.mp4")
@@ -109,15 +115,22 @@ class LiveRecordService : Service() {
             .take(50)
         val name = "${base}_$taskId.${if (converted) "mp4" else "flv"}"
 
+        // 直播成品跟随设置页的视频目录（此前硬编码 Movies/DyDown，设置项对直播无效）
+        val dir = (application as DyDownApp).prefs.saveDir.trim().trimEnd('/')
+            .ifBlank { "Movies/DyDown" } + "/live"
+        val bytes = src.length()
         runCatching {
             MediaStoreWriter(this).saveVideo(
-                src, name, "Movies/DyDown/live",
+                src, name, dir,
                 if (converted) "video/mp4" else "video/x-flv"
             )
-        }.onSuccess {
+        }.onSuccess { uri ->
             TaskRepo.setStatus(this, taskId, TStatus.DONE)
+            HistoryRepo.finishByTask(this, taskId, HStatus.OK, uri.toString(), dir, bytes)
         }.onFailure {
-            TaskRepo.setStatus(this, taskId, TStatus.FAILED, "写入相册失败：${it.message}")
+            val msg = "写入相册失败：${it.message}"
+            TaskRepo.setStatus(this, taskId, TStatus.FAILED, msg)
+            HistoryRepo.finishByTask(this, taskId, HStatus.FAILED, savedDir = dir, error = msg)
         }
 
         runCatching {

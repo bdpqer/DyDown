@@ -7,6 +7,13 @@ import com.dydown.app.data.TaskEntity
 import kotlinx.coroutines.CancellationException
 import java.io.File
 
+/** 下载完成后的成品信息，由 DownloadService 回填到历史记录 */
+data class DownloadResult(
+    val fileUri: String? = null,
+    val savedDir: String? = null,
+    val bytes: Long = 0
+)
+
 /**
  * 一个任务 = 视频 / 图集（图集额外带 BGM）。
  * 进度回调是 suspend 的，方便直接写库和刷通知。
@@ -18,14 +25,13 @@ class DownloadEngine(
 
     private val writer = MediaStoreWriter(context)
 
-    suspend fun run(task: TaskEntity, onProgress: suspend (Int, Long, Long) -> Unit) {
+    suspend fun run(task: TaskEntity, onProgress: suspend (Int, Long, Long) -> Unit): DownloadResult =
         when (task.kind) {
             "GALLERY" -> gallery(task, onProgress)
             else -> video(task, onProgress)
         }
-    }
 
-    private suspend fun video(task: TaskEntity, onProgress: suspend (Int, Long, Long) -> Unit) {
+    private suspend fun video(task: TaskEntity, onProgress: suspend (Int, Long, Long) -> Unit): DownloadResult {
         val url = task.videoUrl?.takeIf { it.startsWith("http") }
             ?: throw IllegalStateException("任务缺少视频地址")
 
@@ -35,13 +41,15 @@ class DownloadEngine(
                 onProgress(percent(bytes, total), bytes, total)
             }
             val name = buildName(task, "mp4")
-            writer.saveVideo(tmp, name, prefs.saveDir)
+            val bytes = tmp.length()
+            val uri = writer.saveVideo(tmp, name, prefs.saveDir)
+            return DownloadResult(uri.toString(), prefs.saveDir, bytes)
         } finally {
             runCatching { tmp.delete() }
         }
     }
 
-    private suspend fun gallery(task: TaskEntity, onProgress: suspend (Int, Long, Long) -> Unit) {
+    private suspend fun gallery(task: TaskEntity, onProgress: suspend (Int, Long, Long) -> Unit): DownloadResult {
         val urls = task.images.split('\n').filter { it.startsWith("http") }
         if (urls.isEmpty()) throw IllegalStateException("图集地址为空")
 
@@ -51,6 +59,7 @@ class DownloadEngine(
         val rel = "$base/gallery_${task.awemeId}"
         var done = 0
         var accBytes = 0L
+        var firstUri: String? = null
 
         for ((index, url) in urls.withIndex()) {
             val ext = imgExt(url)
@@ -60,7 +69,8 @@ class DownloadEngine(
                     val pct = (index * 100) / urls.size
                     onProgress(pct.coerceIn(0, 99), accBytes + bytes, -1)
                 }
-                writer.saveImage(tmp, "${task.awemeId}_${index + 1}.$ext", rel, imgMime(ext))
+                val uri = writer.saveImage(tmp, "${task.awemeId}_${index + 1}.$ext", rel, imgMime(ext))
+                if (firstUri == null) firstUri = uri.toString()
                 done++
                 accBytes += tmp.length()
                 onProgress((done * 100 / urls.size), accBytes, -1)
@@ -83,6 +93,7 @@ class DownloadEngine(
                 runCatching { tmp.delete() }
             }
         }
+        return DownloadResult(firstUri, rel, accBytes)
     }
 
     private fun percent(bytes: Long, total: Long): Int =

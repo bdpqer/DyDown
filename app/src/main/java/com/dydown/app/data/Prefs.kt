@@ -16,6 +16,11 @@ class Prefs(context: Context) {
         get() = sp.getString("imageDir", "Pictures/DyDown") ?: "Pictures/DyDown"
         set(v) = sp.edit().putString("imageDir", v).apply()
 
+    /** 批量下载时按 awemeId 静默跳过已下载成功的作品 */
+    var batchSkipDownloaded: Boolean
+        get() = sp.getBoolean("batchSkipDownloaded", true)
+        set(v) = sp.edit().putBoolean("batchSkipDownloaded", v).apply()
+
     /** 默认选择的清晰度下标 */
     var qualityIndex: Int
         get() = sp.getInt("qualityIndex", 0)

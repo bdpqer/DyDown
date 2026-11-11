@@ -6,6 +6,8 @@ import android.content.Intent
 import android.os.IBinder
 import androidx.core.app.ServiceCompat
 import com.dydown.app.DyDownApp
+import com.dydown.app.data.HStatus
+import com.dydown.app.data.HistoryRepo
 import com.dydown.app.data.TStatus
 import com.dydown.app.data.TaskRepo
 import com.dydown.app.download.DownloadEngine
@@ -14,9 +16,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 下载队列。
@@ -67,16 +71,27 @@ class DownloadService : Service() {
                 updateNotification("${task.author} · ${task.title}", 0)
 
                 try {
-                    engine.run(task) { pct, bytes, total ->
+                    val result = engine.run(task) { pct, bytes, total ->
                         TaskRepo.setProgress(this, task.id, pct, bytes, total)
                         updateNotification(task.title, pct)
                     }
                     TaskRepo.setStatus(this, task.id, TStatus.DONE)
+                    HistoryRepo.finishByTask(
+                        this, task.id, HStatus.OK,
+                        result.fileUri, result.savedDir, result.bytes
+                    )
                 } catch (e: CancellationException) {
-                    TaskRepo.setStatus(this, task.id, TStatus.CANCELED)
+                    withContext(NonCancellable) {
+                        TaskRepo.setStatus(this@DownloadService, task.id, TStatus.CANCELED)
+                        HistoryRepo.finishByTask(
+                            this@DownloadService, task.id, HStatus.CANCELED, error = "已取消"
+                        )
+                    }
                     throw e
                 } catch (e: Exception) {
-                    TaskRepo.setStatus(this, task.id, TStatus.FAILED, e.message ?: "未知错误")
+                    val msg = e.message ?: "未知错误"
+                    TaskRepo.setStatus(this, task.id, TStatus.FAILED, msg)
+                    HistoryRepo.finishByTask(this, task.id, HStatus.FAILED, error = msg)
                 }
             }
         } finally {
