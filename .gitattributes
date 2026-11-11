@@ -1,0 +1,13 @@
+# 统一仓库内换行为 LF；gradlew 在 Windows checkout 也必须保持 LF（否则 Linux 上无法执行）
+* text=auto eol=lf
+gradlew text eol=lf
+*.sh text eol=lf
+gradlew.bat text eol=crlf
+*.bat text eol=crlf
+
+# 二进制文件不做换行转换
+*.jar binary
+*.png binary
+*.jpg binary
+*.webp binary
+*.apk binary
