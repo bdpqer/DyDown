@@ -27,6 +27,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -95,6 +96,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             emit(emptyList())
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(3000), emptyList())
+
+    /** 已成功下载的作品 ID。只查一列，不受列表 LIMIT 2000 影响，供批量页实时显示 */
+    val downloadedIds: StateFlow<Set<String>> = HistoryRepo.observeDownloadedIds(ctx)
+        .map { ids: List<String> -> ids.toSet() }
+        .catch { e ->
+            Log.e("DyDown", "downloadedIds flow failed", e)
+            emit(emptySet<String>())
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(3000), emptySet<String>())
 
     fun clearToast() { toast = null }
 
@@ -290,18 +300,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         viewModelScope.launch {
-            val skip: Set<String> = if (prefs.batchSkipDownloaded) {
+            val enabled = prefs.batchSkipDownloaded
+            // 实际决策仍查一次 DAO，确保拿到最新状态；Flow 只用于界面显示
+            val skip: Set<String> = if (enabled) {
                 HistoryRepo.downloadedIds(ctx).toHashSet()
             } else emptySet()
             val targets = chosen.filterNot { skip.contains(it.awemeId) }
             val skipped = chosen.size - targets.size
-            if (targets.isEmpty()) {
-                toast = "全部 ${chosen.size} 条已下载过，已跳过"
-                return@launch
-            }
             var added = 0
+            var noMedia = 0
             targets.forEach { meta ->
-                if (meta.videos.isEmpty() && meta.images.isEmpty()) return@forEach
+                if (meta.videos.isEmpty() && meta.images.isEmpty()) {
+                    noMedia++
+                    return@forEach
+                }
                 val taskId = TaskRepo.insert(ctx, taskFrom(meta, 0))
                 HistoryRepo.insert(
                     ctx,
@@ -320,9 +332,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 added++
             }
-            DownloadService.start(ctx)
-            toast = "已加入 $added 个任务" +
-                if (skipped > 0) "，跳过 $skipped 条已下载" else ""
+            if (targets.isNotEmpty()) DownloadService.start(ctx)
+            toast = buildString {
+                append("已选 ${chosen.size} 条")
+                if (!enabled) append("（去重已关闭）")
+                if (skipped > 0) append("，跳过 $skipped 条已下载")
+                append("，实际加入 $added 个任务")
+                if (noMedia > 0) append("，$noMedia 条无媒体地址")
+            }
+            Log.d(
+                "DyDown",
+                "batchDownload chosen=${chosen.size} enabled=$enabled skipSet=${skip.size} " +
+                    "skipped=$skipped added=$added noMedia=$noMedia"
+            )
         }
     }
 

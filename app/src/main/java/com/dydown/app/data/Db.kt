@@ -180,6 +180,10 @@ interface HistoryDao {
     @Query("SELECT DISTINCT awemeId FROM history WHERE type = 'DOWNLOAD' AND status = 'OK' AND awemeId <> ''")
     suspend fun downloadedIds(): List<String>
 
+    /** 只查 ID 一列，不受列表查询 LIMIT 影响，供批量页实时显示「已下载」标记 */
+    @Query("SELECT DISTINCT awemeId FROM history WHERE type = 'DOWNLOAD' AND status = 'OK' AND awemeId <> ''")
+    fun observeDownloadedIds(): Flow<List<String>>
+
     @Query("SELECT sourceLink FROM history WHERE taskId = :taskId AND sourceLink <> '' ORDER BY id DESC LIMIT 1")
     suspend fun sourceLinkByTask(taskId: Long): String?
 
@@ -296,6 +300,7 @@ object HistoryRepo {
     )
 
     suspend fun downloadedIds(context: Context): List<String> = dao(context).downloadedIds()
+    fun observeDownloadedIds(context: Context): Flow<List<String>> = dao(context).observeDownloadedIds()
     suspend fun sourceLinkByTask(context: Context, taskId: Long): String? = dao(context).sourceLinkByTask(taskId)
     suspend fun updateCover(context: Context, id: Long, path: String) = dao(context).updateCover(id, path)
     suspend fun delete(context: Context, id: Long) = dao(context).delete(id)

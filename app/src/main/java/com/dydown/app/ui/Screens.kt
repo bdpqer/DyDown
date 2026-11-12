@@ -349,6 +349,11 @@ private fun BatchScreen(vm: MainViewModel) {
     val clipboard = LocalClipboardManager.current
     var text by remember { mutableStateOf("") }
     val b = vm.batch
+    val downloaded by vm.downloadedIds.collectAsStateWithLifecycle()
+    val skipEnabled = vm.batchSkipDownloaded
+    val chosenList = b.items.filter { b.selected.contains(it.awemeId) }
+    val alreadyCount = if (skipEnabled) chosenList.count { downloaded.contains(it.awemeId) } else 0
+    val willDownload = chosenList.size - alreadyCount
 
     Column(
         Modifier
@@ -395,11 +400,30 @@ private fun BatchScreen(vm: MainViewModel) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("${b.items.size} 条", style = MaterialTheme.typography.labelLarge)
                 Spacer(Modifier.width(12.dp))
-                Text("已选 ${b.selected.size}", style = MaterialTheme.typography.labelMedium)
+                Text("已选 ${chosenList.size}", style = MaterialTheme.typography.labelMedium)
                 Spacer(Modifier.weight(1f))
                 TextButton(onClick = { vm.selectAll(b.selected.size != b.items.size) }) {
                     Text(if (b.selected.size == b.items.size) "全不选" else "全选")
                 }
+            }
+            // 去重结果直接摆在界面上：不用等点下载才知道有没有生效
+            if (chosenList.isNotEmpty()) {
+                Text(
+                    if (skipEnabled) {
+                        "其中已下载 $alreadyCount 条 · 实际将下载 $willDownload 条" +
+                            if (downloaded.isEmpty()) "（历史记录为空）" else ""
+                    } else "去重已关闭 · 将下载全部 ${chosenList.size} 条",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (willDownload == 0) {
+                        MaterialTheme.colorScheme.tertiary
+                    } else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else if (b.items.isNotEmpty() && downloaded.isNotEmpty()) {
+                Text(
+                    "本页有 ${b.items.count { downloaded.contains(it.awemeId) }} 条已下载过",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
             HorizontalDivider()
         }
@@ -409,6 +433,7 @@ private fun BatchScreen(vm: MainViewModel) {
                 BatchRow(
                     meta = item,
                     checked = b.selected.contains(item.awemeId),
+                    downloaded = skipEnabled && downloaded.contains(item.awemeId),
                     onToggle = { vm.toggle(item.awemeId) }
                 )
             }
@@ -428,7 +453,7 @@ private fun BatchScreen(vm: MainViewModel) {
                 }
                 Spacer(Modifier.weight(1f))
                 Button(onClick = { vm.downloadSelected() }) {
-                    Text("下载选中 (${b.selected.size})")
+                    Text("下载选中 ($willDownload)")
                 }
             }
         }
@@ -436,7 +461,7 @@ private fun BatchScreen(vm: MainViewModel) {
 }
 
 @Composable
-private fun BatchRow(meta: MediaMeta, checked: Boolean, onToggle: () -> Unit) {
+private fun BatchRow(meta: MediaMeta, checked: Boolean, downloaded: Boolean, onToggle: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -464,9 +489,11 @@ private fun BatchRow(meta: MediaMeta, checked: Boolean, onToggle: () -> Unit) {
             // 显示作者，方便一眼核对列表里有没有混进别人家的作品
             Text(
                 (if (meta.kind == Kind.GALLERY) "图集 ${meta.images.size} 张" else "视频") +
-                    if (meta.author.isNotBlank()) " · @${meta.author}" else "",
+                    (if (meta.author.isNotBlank()) " · @${meta.author}" else "") +
+                    if (downloaded) " · 已下载" else "",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
+                color = if (downloaded) MaterialTheme.colorScheme.outline
+                else MaterialTheme.colorScheme.primary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
