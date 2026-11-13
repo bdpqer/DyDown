@@ -98,21 +98,28 @@ class ParseRepository(
         val errors = mutableListOf<String>()
         val target = LinkResolver.resolveLive(text)  // 解析失败会带可操作提示直接冒泡
 
+        // 三条通道统一在出口净化流地址：SSR / 页面响应 / 接口都可能带 &amp;，
+        // 不还原会让 CDN 鉴权参数失效并返回 403（见 LivePageParser.sanitizeUrl）。
+        fun clean(info: LiveInfo) = info.copy(
+            flv = info.flv?.let { LivePageParser.sanitizeUrl(it) },
+            hls = info.hls?.let { LivePageParser.sanitizeUrl(it) }
+        )
+
         // 通道 1：直播页 SSR 直取（实测 1.1MB 页面内嵌 flv_pull_url，无需签名、最快最稳）
         runCatching {
             val html = Http.getString(target.pageUrl, "https://live.douyin.com/")
             dumpLive(target.pageUrl, html)
-            return LivePageParser.parse(html, target)
+            return clean(LivePageParser.parse(html, target))
         }.onFailure { errors.add("· 直播页：${it.message ?: it.javaClass.simpleName}") }
 
         // 通道 2：WebView 打开直播页，搬页面自己发出的接口响应
         runCatching {
             val res = bridge.loadAndScrape(target.pageUrl)
-            return RouterDataParser.extractLive(res.json, target.webRid)
+            return clean(RouterDataParser.extractLive(res.json, target.webRid))
         }.onFailure { errors.add("· 页面抓取：${it.message ?: it.javaClass.simpleName}") }
 
         // 通道 3：web/enter 接口（页面上下文 fetch）
-        runCatching { return api.live(target.webRid) }
+        runCatching { return clean(api.live(target.webRid)) }
             .onFailure { errors.add("· 接口：${it.message ?: it.javaClass.simpleName}") }
 
         throw ParseException("直播解析失败：\n" + errors.joinToString("\n"))

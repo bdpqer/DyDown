@@ -41,7 +41,7 @@ object LivePageParser {
             .replace("\\\"", "\"")
 
         val urls = urlRegex.findAll(s)
-            .map { it.value.trimEnd('}', ')', ',', ']', ';') }
+            .map { sanitizeUrl(it.value.trimEnd('}', ')', ',', ']', ';')) }
             .distinct()
             .toList()
 
@@ -97,6 +97,22 @@ object LivePageParser {
     }
 
     /** 同档位里取参数更完整（更长）的那条，避免拿到缺 auth_key 的短链 */
+    /**
+     * 直播 SSR 里流地址的查询参数常被 HTML 实体 / JSON unicode 双重转义：
+     *   \u0026amp;wsSecret=... → 还原 unicode 后是 &amp;wsSecret=...
+     * 若不再还原成 &，CDN 只认得到第一个参数 keeptime，wsSecret/wsTime 全部失效 → HTTP 403。
+     * 实测：带 &amp; 返回 403；还原后返回 200 且能持续拉到流。
+     */
+    fun sanitizeUrl(u: String): String {
+        var s = u.replace("\\" + "u0026", "&", ignoreCase = true)
+        // 重复两次以兼容 &amp;amp; 这类二次转义
+        repeat(2) { s = s.replace("&amp;", "&", ignoreCase = true) }
+        return s.replace("&#38;", "&")
+            .replace("&#x26;", "&", ignoreCase = true)
+            .replace("\\/", "/")
+            .trim()
+    }
+
     private fun pickBest(urls: List<String>, ext: String): String? {
         var best: String? = null
         for (u in urls) {

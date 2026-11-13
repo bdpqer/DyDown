@@ -88,9 +88,18 @@ class LiveRecordService : Service() {
             } catch (e: Exception) {
                 withContext(NonCancellable) {
                     val msg = e.message ?: "录制失败"
-                    TaskRepo.setStatus(this@LiveRecordService, taskId, TStatus.FAILED, msg)
-                    HistoryRepo.finishByTask(this@LiveRecordService, taskId, HStatus.FAILED, error = msg)
-                    runCatching { tmp.delete() }
+                    // 流被掐断 / 读超时时通常已经录到了大段内容，
+                    // 先按正常流程落盘保住，只有确实没内容才判失败并清理。
+                    val saved = runCatching { finalize(taskId, tmp) }.getOrDefault(false)
+                    if (!saved) {
+                        TaskRepo.setStatus(this@LiveRecordService, taskId, TStatus.FAILED, msg)
+                        HistoryRepo.finishByTask(
+                            this@LiveRecordService, taskId, HStatus.FAILED, error = msg
+                        )
+                        runCatching { tmp.delete() }
+                    } else {
+                        android.util.Log.d("DyDown", "live stream ended early but saved: $msg")
+                    }
                 }
             } finally {
                 ServiceCompat.stopForeground(this@LiveRecordService, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -99,11 +108,12 @@ class LiveRecordService : Service() {
         }
     }
 
-    private suspend fun finalize(taskId: Long, flv: File) {
+    /** @return 是否成功把成品写入相册（false 表示无有效内容或写入失败） */
+    private suspend fun finalize(taskId: Long, flv: File): Boolean {
         if (!flv.exists() || flv.length() < 1024) {
             TaskRepo.setStatus(this, taskId, TStatus.FAILED, "没有录到数据")
             HistoryRepo.finishByTask(this, taskId, HStatus.FAILED, error = "没有录到数据")
-            return
+            return false
         }
         val mp4 = File(cacheDir, "live_$taskId.mp4")
         val converted = Ffmpeg.toMp4(this, flv, mp4)
@@ -119,7 +129,7 @@ class LiveRecordService : Service() {
         val dir = (application as DyDownApp).prefs.saveDir.trim().trimEnd('/')
             .ifBlank { "Movies/DyDown" } + "/live"
         val bytes = src.length()
-        runCatching {
+        val saved = runCatching {
             MediaStoreWriter(this).saveVideo(
                 src, name, dir,
                 if (converted) "video/mp4" else "video/x-flv"
@@ -131,12 +141,13 @@ class LiveRecordService : Service() {
             val msg = "写入相册失败：${it.message}"
             TaskRepo.setStatus(this, taskId, TStatus.FAILED, msg)
             HistoryRepo.finishByTask(this, taskId, HStatus.FAILED, savedDir = dir, error = msg)
-        }
+        }.isSuccess
 
         runCatching {
             flv.delete()
             if (converted) mp4.delete()
         }
+        return saved
     }
 
     private fun notification(title: String, bytes: Long, text: String) =

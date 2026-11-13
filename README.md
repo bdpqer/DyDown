@@ -41,7 +41,10 @@ JSON 字段层级，而 `JsonScan` 用递归找 key，对层级变化有容错�
 - 主页抓包会混入 `/aweme/favorite/`（喜欢列表）等**其他作者**的作品，
   因此只认 `/aweme/post/` 响应并按 `author.sec_uid` 二次过滤；
 - 直播短链会重定位到 `webcast reflow`，19 位 `room_id` 不是 `web_rid`；
-  流地址从 `live.douyin.com/{webRid}` 的 SSR 里取，并还原 `\u0026` 为 `&`。
+  流地址从 `live.douyin.com/{webRid}` 的 SSR 里取，除还原 `\u0026` 外还必须把
+  HTML 实体 `&amp;` 还原成 `&`，否则 `wsSecret` / `wsTime` 鉴权参数只被当成
+  `keeptime` 的一部分，CDN 直接返回 403（实测还原后可持续拉流）；
+  录制中途流被掐断时仍会落盘已录到的部分，不再整段丢弃。
 
 无水印处理：`/playwm/` → `/play/`，并把 `ratio=720p` 改写为 `1080p`。
 
